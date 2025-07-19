@@ -1,0 +1,8 @@
+*.csv
+*.json
+*.txt
+*.pth
+
+__pycache__/
+accel_plots_by_orientation/
+data/
