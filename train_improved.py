@@ -159,7 +159,7 @@ class FeatureEngineer:
             
             # Angular distance
             seq_data['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
-            6
+            
             # Jerk
             jerk = FeatureEngineer.calculate_jerk(acc_data)
             seq_data[['jerk_x', 'jerk_y', 'jerk_z']] = jerk
@@ -308,12 +308,11 @@ class ImprovedBFRBModel(nn.Module):
             ResidualBlock(768, 1024),
         )
         
-        # Global context attention
-        self.attention = nn.Sequential(
+        # Global context attention (without final softmax for masking)
+        self.attention_conv = nn.Sequential(
             nn.Conv1d(1024, 128, kernel_size=1),
             nn.Tanh(),
-            nn.Conv1d(128, 1, kernel_size=1),
-            nn.Softmax(dim=2)
+            nn.Conv1d(128, 1, kernel_size=1)
         )
         
         # Shared fully connected layers
@@ -364,7 +363,25 @@ class ImprovedBFRBModel(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, x):
+    def create_attention_mask(self, seq_len, lengths):
+        """Create attention mask for padded sequences"""
+        batch_size = lengths.size(0)
+        max_len = seq_len
+        
+        # Create a tensor of sequence positions
+        seq_range = torch.arange(0, max_len).to(lengths.device)
+        seq_range = seq_range.unsqueeze(0).expand(batch_size, max_len)
+        
+        # Create mask: True for real data, False for padding
+        lengths_expanded = lengths.unsqueeze(1).expand(batch_size, max_len)
+        mask = seq_range < lengths_expanded
+        
+        return mask.float()
+    
+    def forward(self, x, lengths=None):
+        batch_size = x.size(0)
+        seq_len = x.size(2)
+        
         # Split sensor data
         imu_data = x[:, :self.n_imu_total, :]
         thm_data = x[:, self.n_imu_total:self.n_imu_total+self.n_thm_features, :]
@@ -381,12 +398,42 @@ class ImprovedBFRBModel(nn.Module):
         # Apply fusion layers
         fused = self.fusion_layers(combined)
         
-        # Apply attention
-        attention_weights = self.attention(fused)
+        # Apply attention with masking
+        attention_logits = self.attention_conv(fused)  # Get attention logits
+        attention_logits = attention_logits.squeeze(1)  # Remove channel dimension
+        
+        if lengths is not None:
+            # Adjust lengths for downsampling through the network
+            # We have stride=2 in encoders, so effective sequence length is reduced
+            downsampled_lengths = (lengths + 1) // 2  # Account for stride=2
+            # AdaptiveAvgPool1d operations don't change the sequence length conceptually
+            # but we need to account for the actual output size from fusion layers
+            fused_seq_len = fused.size(2)
+            
+            # Create attention mask for the fused sequence length
+            attention_mask = self.create_attention_mask(fused_seq_len, downsampled_lengths)
+            
+            # Apply mask by setting padded positions to -inf before softmax
+            attention_logits = attention_logits.masked_fill(~attention_mask.bool(), float('-inf'))
+        
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_logits, dim=1).unsqueeze(1)
+        
+        # Apply attention weights
         weighted = fused * attention_weights
         
-        # Global pooling
-        global_features = weighted.sum(dim=2)
+        # Global pooling with masking
+        if lengths is not None:
+            # Sum only over non-padded positions
+            attention_mask = attention_mask.unsqueeze(1)  # Add channel dimension
+            weighted_masked = weighted * attention_mask
+            global_features = weighted_masked.sum(dim=2)
+            
+            # Normalize by actual sequence length to get true average
+            valid_lengths = attention_mask.sum(dim=2).clamp(min=1)  # Avoid division by zero
+            global_features = global_features / valid_lengths
+        else:
+            global_features = weighted.sum(dim=2)
         
         # Shared processing
         shared = self.shared_fc(global_features)
@@ -561,6 +608,7 @@ def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimize
         sequences = sequences.to(device)
         labels_b = labels_b.to(device)
         labels_m = labels_m.to(device)
+        lengths = lengths.to(device)
         
         # Apply mixup augmentation
         if use_mixup and np.random.random() < 0.5:
@@ -568,13 +616,13 @@ def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimize
                 sequences, labels_b, labels_m, CONFIG['mixup_alpha']
             )
             
-            outputs = model(sequences)
+            outputs = model(sequences, lengths)
             loss_binary = lam * criterion_binary(outputs['binary'], labels_b_a) + \
                         (1 - lam) * criterion_binary(outputs['binary'], labels_b_b)
             loss_multi = lam * criterion_multi(outputs['multiclass'], labels_m_a) + \
                        (1 - lam) * criterion_multi(outputs['multiclass'], labels_m_b)
         else:
-            outputs = model(sequences)
+            outputs = model(sequences, lengths)
             loss_binary = criterion_binary(outputs['binary'], labels_b)
             loss_multi = criterion_multi(outputs['multiclass'], labels_m)
 
@@ -614,8 +662,9 @@ def validate(model, val_loader, device, criterion_binary=None, criterion_multi=N
             sequences = sequences.to(device)
             labels_b_tensor = labels_b.to(device)
             labels_m_tensor = labels_m.to(device)
+            lengths = lengths.to(device)
             
-            outputs = model(sequences)
+            outputs = model(sequences, lengths)
             
             # Calculate validation loss if criteria provided
             if criterion_binary is not None and criterion_multi is not None:
