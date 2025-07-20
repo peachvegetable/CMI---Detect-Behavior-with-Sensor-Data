@@ -38,10 +38,15 @@ CMI---Detect-Behavior-with-Sensor-Data/
 
 ## Core Commands
 
+**Important**: Run all commands from the project root directory.
+
 ```bash
+# Navigate to project root
+cd /path/to/CMI---Detect-Behavior-with-Sensor-Data
+
 # Main training scripts
 python scripts/train/train_best.py           # Best performing model
-python scripts/test/train_improved.py        # With attention masking
+python scripts/train/train_improved.py       # With attention masking
 
 # Model inference
 python scripts/inference_improved.py
@@ -57,6 +62,9 @@ python scripts/test/test_best.py
 
 # Generate Kaggle submission
 python scripts/submission/kaggle_submission_improved.py
+
+# Test path configuration
+python scripts/test/test_paths.py
 ```
 
 ## Model Architecture
@@ -75,7 +83,7 @@ The repository contains neural network architectures in `scripts/model.py`:
 
 ## Training Process
 
-### Latest Training Script (`scripts/test/train_improved.py`)
+### Latest Training Script (`scripts/train/train_improved.py`)
 
 Key improvements:
 - **Attention masking**: Properly handles variable-length sequences

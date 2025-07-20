@@ -7,7 +7,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import the model
-from train_improved import ImprovedBFRBModel, CONFIG
+from scripts.train.train_improved import ImprovedBFRBModel, CONFIG
 
 def test_model_with_attention_mask():
     print("Testing Model with Attention Masking")

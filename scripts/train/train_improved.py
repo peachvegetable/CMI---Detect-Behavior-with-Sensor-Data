@@ -16,6 +16,11 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
+
+# Get the root directory of the project
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -709,7 +714,7 @@ def main():
     
     # Load data
     print("\n Loading data...")
-    df = pd.read_csv('data/train.csv')
+    df = pd.read_csv(os.path.join(DATA_DIR, 'train.csv'))
     print(f"Total samples: {len(df):,}")
     
     # NO BEHAVIOR FILTERING - work with all data
@@ -907,7 +912,7 @@ def main():
                         'config': CONFIG,
                         'feature_cols': feature_cols,
                         'n_features': len(feature_cols)
-                    }, f'improved_model_fold_{fold}.pth')
+                    }, os.path.join(PROJECT_ROOT, f'improved_model_fold_{fold}.pth'))
                     
                     print(f"Saved best model (score: {best_score:.4f})")
                 else:
@@ -945,7 +950,7 @@ def main():
             'config': CONFIG
         }
         
-        with open('improved_training_results.json', 'w') as f:
+        with open(os.path.join(PROJECT_ROOT, 'improved_training_results.json'), 'w') as f:
             json.dump(results, f, indent=2)
     
     print("\n Training complete!")
