@@ -29,7 +29,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.nn.utils.rnn import pad_sequence
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+except ImportError:
+    StratifiedGroupKFold = None
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from scipy.spatial.transform import Rotation as R
 from sklearn.metrics import f1_score, classification_report
@@ -49,8 +53,8 @@ CONFIG = {
     
     # Model parameters
     'dropout': 0.3,
-    'label_smoothing': 0.15,
-    'focal_gamma': 2.5,
+    'label_smoothing': 0.1,  # Reduced from 0.15 to match high-scoring notebooks
+    'focal_gamma': 2.0,  # Reduced from 2.5
     'mixup_alpha': 0.3,
     
     # Feature engineering
@@ -58,6 +62,10 @@ CONFIG = {
     'use_angular_distance': True,
     'use_statistical_features': True,
     'window_size': 10,  # for statistical features
+    
+    # IMU-only masking for realistic test simulation
+    'imu_only_train_prob': 0.35,  # 35% IMU-only during training (matches high-scoring notebooks)
+    'imu_only_val_prob': 0.5,    # 50% IMU-only during validation (matches test)
     
     # Cross-validation
     'n_folds': 5,
@@ -239,6 +247,19 @@ class FeatureEngineer:
             angular_vel = FeatureEngineer.calculate_angular_velocity(rot_data)
             seq_data[['ang_vel_x', 'ang_vel_y', 'ang_vel_z']] = angular_vel
             
+            # Angular velocity magnitude
+            seq_data['angular_vel_mag'] = np.sqrt(
+                angular_vel[:, 0]**2 + angular_vel[:, 1]**2 + angular_vel[:, 2]**2
+            )
+            
+            # Angular velocity magnitude jerk
+            seq_data['angular_vel_mag_jerk'] = seq_data['angular_vel_mag'].diff().fillna(0)
+            
+            # Gesture rhythm signature - key discriminative feature
+            seq_data['gesture_rhythm_signature'] = seq_data['linear_acc_mag'].rolling(
+                5, min_periods=1
+            ).std() / (seq_data['linear_acc_mag'].rolling(5, min_periods=1).mean() + 1e-6)
+            
             # Angular distance (frame-to-frame, not cumulative)
             seq_data['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
             
@@ -324,13 +345,13 @@ class ImprovedBFRBModel(nn.Module):
         self.n_engineered_features = 0
         
         if CONFIG['use_angular_velocity']:
-            self.n_engineered_features += 3
+            self.n_engineered_features += 5  # ang_vel(3) + mag(1) + mag_jerk(1)
         if CONFIG['use_angular_distance']:
             self.n_engineered_features += 1
         if CONFIG['use_statistical_features']:
             # Now includes: linear_acc(3) + linear_acc_mag(1) + linear_acc_mag_jerk(1) + 
-            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) = 13
-            self.n_engineered_features += 13
+            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) + rhythm_sig(1) = 14
+            self.n_engineered_features += 14
             
         self.n_imu_total = self.n_imu_features + self.n_engineered_features
         self.n_thm_features = 5
@@ -447,7 +468,7 @@ class ImprovedBFRBModel(nn.Module):
         
         return mask.float()
     
-    def forward(self, x, lengths=None):
+    def forward(self, x, lengths=None, sensor_mask=None):
         batch_size = x.size(0)
         seq_len = x.size(2)
         
@@ -455,6 +476,13 @@ class ImprovedBFRBModel(nn.Module):
         imu_data = x[:, :self.n_imu_total, :]
         thm_data = x[:, self.n_imu_total:self.n_imu_total+self.n_thm_features, :]
         tof_data = x[:, self.n_imu_total+self.n_thm_features:, :]
+        
+        # Apply sensor masking if provided (for simulating IMU-only test conditions)
+        if sensor_mask is not None:
+            # sensor_mask is a boolean tensor where True = IMU-only
+            # Zero out non-IMU sensors for masked samples
+            thm_data = thm_data * (~sensor_mask).float().unsqueeze(1).unsqueeze(2)
+            tof_data = tof_data * (~sensor_mask).float().unsqueeze(1).unsqueeze(2)
         
         # Encode each sensor type
         imu_features = self.imu_encoder(imu_data)
@@ -637,8 +665,9 @@ def create_variable_sequences(df, feature_cols):
     multiclass_labels = []
     sequence_lengths = []
     sequence_ids = []
+    subjects = []  # Add subject tracking
     
-    for seq_id in tqdm(df['sequence_id'].unique(), desc="Creating sequences"):
+    for seq_id in tqdm(df['sequence_id'].unique(), desc="Creating sequences", leave=False):
         seq_data = df[df['sequence_id'] == seq_id]
         
         features = seq_data[feature_cols].values
@@ -652,26 +681,34 @@ def create_variable_sequences(df, feature_cols):
             binary_label = 0
             multiclass_label = 0
         
+        # Get subject ID if available
+        if 'subject' in seq_data.columns:
+            subject = seq_data['subject'].iloc[0]
+        else:
+            subject = seq_id  # Fallback to sequence_id if no subject column
+        
         sequences.append(features)
         binary_labels.append(binary_label)
         multiclass_labels.append(multiclass_label)
         sequence_lengths.append(len(features))
         sequence_ids.append(seq_id)
+        subjects.append(subject)
     
     return (
         sequences,  # List of variable length arrays
         np.array(binary_labels),
         np.array(multiclass_labels),
         np.array(sequence_lengths),
-        np.array(sequence_ids)
+        np.array(sequence_ids),
+        np.array(subjects)  # Return subjects array
     )
 
 
-def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimizer, device, use_mixup=True):
-    """Train for one epoch"""
+def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimizer, device, use_mixup=True, imu_only_prob=0.3):
+    """Train for one epoch with IMU-only augmentation"""
     model.train()
     total_loss = 0
-    progress_bar = tqdm(train_loader, desc='Training')
+    progress_bar = tqdm(train_loader, desc='Training', leave=False)
     
     for batch_idx, (sequences, labels_b, labels_m, lengths) in enumerate(progress_bar):
         sequences = sequences.to(device)
@@ -679,19 +716,24 @@ def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimize
         labels_m = labels_m.to(device)
         lengths = lengths.to(device)
         
+        # Create sensor mask for IMU-only augmentation
+        batch_size = sequences.size(0)
+        sensor_mask = torch.rand(batch_size) < imu_only_prob
+        sensor_mask = sensor_mask.to(device)
+        
         # Apply mixup augmentation
         if use_mixup and np.random.random() < 0.5:
             sequences, labels_b_a, labels_b_b, labels_m_a, labels_m_b, lam = mixup_data(
                 sequences, labels_b, labels_m, CONFIG['mixup_alpha']
             )
             
-            outputs = model(sequences, lengths)
+            outputs = model(sequences, lengths, sensor_mask=sensor_mask)
             loss_binary = lam * criterion_binary(outputs['binary'], labels_b_a) + \
                         (1 - lam) * criterion_binary(outputs['binary'], labels_b_b)
             loss_multi = lam * criterion_multi(outputs['multiclass'], labels_m_a) + \
                        (1 - lam) * criterion_multi(outputs['multiclass'], labels_m_b)
         else:
-            outputs = model(sequences, lengths)
+            outputs = model(sequences, lengths, sensor_mask=sensor_mask)
             loss_binary = criterion_binary(outputs['binary'], labels_b)
             loss_multi = criterion_multi(outputs['multiclass'], labels_m)
 
@@ -717,8 +759,8 @@ def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimize
     return total_loss / len(train_loader)
 
 
-def validate(model, val_loader, device, criterion_binary=None, criterion_multi=None):
-    """Validate the model"""
+def validate(model, val_loader, device, criterion_binary=None, criterion_multi=None, realistic_test=True):
+    """Validate the model with realistic test conditions (50% IMU-only)"""
     model.eval()
     binary_preds = []
     binary_true = []
@@ -727,13 +769,21 @@ def validate(model, val_loader, device, criterion_binary=None, criterion_multi=N
     total_loss = 0
     
     with torch.no_grad():
-        for sequences, labels_b, labels_m, lengths in tqdm(val_loader, desc='Validating'):
+        for sequences, labels_b, labels_m, lengths in tqdm(val_loader, desc='Validating', leave=False):
             sequences = sequences.to(device)
             labels_b_tensor = labels_b.to(device)
             labels_m_tensor = labels_m.to(device)
             lengths = lengths.to(device)
             
-            outputs = model(sequences, lengths)
+            # Simulate realistic test conditions - 50% IMU-only
+            if realistic_test:
+                batch_size = sequences.size(0)
+                sensor_mask = torch.rand(batch_size) < 0.5  # 50% IMU-only
+                sensor_mask = sensor_mask.to(device)
+            else:
+                sensor_mask = None
+            
+            outputs = model(sequences, lengths, sensor_mask=sensor_mask)
             
             # Calculate validation loss if criteria provided
             if criterion_binary is not None and criterion_multi is not None:
@@ -761,8 +811,100 @@ def validate(model, val_loader, device, criterion_binary=None, criterion_multi=N
         'competition_score': competition_score
     }
     
-    if criterion_binary is not None:
+    if criterion_binary is not None and len(val_loader) > 0:
         result['val_loss'] = total_loss / len(val_loader)
+    else:
+        result['val_loss'] = 0.0  # Default value if no batches
+    
+    return result
+
+
+def validate_dual(model, val_loader, device, criterion_binary=None, criterion_multi=None):
+    """
+    Dual evaluation strategy: evaluate on both full-sensor and IMU-only data
+    This gives a more realistic estimate of test performance
+    """
+    model.eval()
+    
+    # First pass: Full sensor evaluation
+    full_sensor_results = validate(model, val_loader, device, criterion_binary, criterion_multi, realistic_test=False)
+    
+    # Second pass: IMU-only evaluation (force all sequences to be IMU-only)
+    imu_only_binary_preds = []
+    imu_only_binary_true = []
+    imu_only_multi_preds = []
+    imu_only_multi_true = []
+    imu_only_loss = 0
+    
+    with torch.no_grad():
+        for sequences, labels_b, labels_m, lengths in tqdm(val_loader, desc='IMU-only eval', leave=False):
+            sequences = sequences.to(device)
+            labels_b_tensor = labels_b.to(device)
+            labels_m_tensor = labels_m.to(device)
+            lengths = lengths.to(device)
+            
+            # Force ALL sequences to be IMU-only
+            batch_size = sequences.size(0)
+            sensor_mask = torch.ones(batch_size, dtype=torch.bool).to(device)  # All True = all IMU-only
+            
+            outputs = model(sequences, lengths, sensor_mask=sensor_mask)
+            
+            # Calculate validation loss if criteria provided
+            if criterion_binary is not None and criterion_multi is not None:
+                loss_binary = criterion_binary(outputs['binary'], labels_b_tensor)
+                loss_multi = criterion_multi(outputs['multiclass'], labels_m_tensor)
+                loss = 0.6 * loss_binary + 0.4 * loss_multi
+                imu_only_loss += loss.item()
+            
+            binary_pred = torch.argmax(outputs['binary'], dim=1).cpu().numpy()
+            multi_pred = torch.argmax(outputs['multiclass'], dim=1).cpu().numpy()
+            
+            imu_only_binary_preds.extend(binary_pred)
+            imu_only_binary_true.extend(labels_b.numpy())
+            imu_only_multi_preds.extend(multi_pred)
+            imu_only_multi_true.extend(labels_m.numpy())
+    
+    # Calculate IMU-only F1 scores
+    imu_binary_f1 = f1_score(imu_only_binary_true, imu_only_binary_preds, average='binary')
+    imu_multi_f1 = f1_score(imu_only_multi_true, imu_only_multi_preds, average='macro')
+    imu_competition_score = (imu_binary_f1 + imu_multi_f1) / 2
+    
+    # Third pass: Mixed evaluation (original 50/50 approach)
+    print("  Evaluating with mixed sensors (50% IMU-only)...")
+    mixed_results = validate(model, val_loader, device, criterion_binary, criterion_multi, realistic_test=True)
+    
+    # Compute realistic composite scores (average of full and IMU-only)
+    realistic_binary_f1 = (full_sensor_results['binary_f1'] + imu_binary_f1) / 2
+    realistic_multi_f1 = (full_sensor_results['multi_f1'] + imu_multi_f1) / 2
+    realistic_competition_score = (realistic_binary_f1 + realistic_multi_f1) / 2
+    
+    # Compute sensor dependency metrics
+    sensor_dependency = full_sensor_results['competition_score'] - imu_competition_score
+    performance_stability = 1.0 - (abs(sensor_dependency) / max(full_sensor_results['competition_score'], 0.01))
+    
+    result = {
+        # Individual evaluations
+        'full_sensor': full_sensor_results,
+        'imu_only': {
+            'binary_f1': imu_binary_f1,
+            'multi_f1': imu_multi_f1,
+            'competition_score': imu_competition_score
+        },
+        'mixed_50_50': mixed_results,
+        
+        # Realistic composite scores (main metrics to track)
+        'realistic_binary_f1': realistic_binary_f1,
+        'realistic_multi_f1': realistic_multi_f1,
+        'realistic_competition_score': realistic_competition_score,
+        
+        # Analysis metrics
+        'sensor_dependency': sensor_dependency,
+        'performance_stability': performance_stability
+    }
+    
+    if criterion_binary is not None:
+        result['imu_only']['val_loss'] = imu_only_loss / len(val_loader)
+        result['realistic_val_loss'] = (full_sensor_results['val_loss'] + result['imu_only']['val_loss']) / 2
     
     return result
 
@@ -809,30 +951,42 @@ def main():
         df['gesture_encoded'] = 0
         label_encoder = None
     
-    # Feature columns (including engineered features)
-    # Note: We now use linear_acc instead of raw acc for better feature representation
-    base_feature_cols = [col for col in df.columns if col.startswith(('linear_acc_', 'rot_', 'thm_', 'tof_'))]
-    # Keep acc_ columns for compatibility but they shouldn't be primary features
-    base_feature_cols += [col for col in df.columns if col.startswith('acc_') and col not in base_feature_cols]
-    engineered_cols = []
+    # Feature columns - MUST match model's expected order:
+    # 1. IMU features (linear_acc, rot, then engineered)
+    # 2. Thermopile features (thm_)
+    # 3. ToF features (tof_)
     
+    # Collect IMU base features
+    imu_base_cols = []
+    imu_base_cols += [col for col in df.columns if col.startswith('linear_acc_')]
+    imu_base_cols += [col for col in df.columns if col.startswith('rot_')]
+    
+    # Collect engineered IMU features
+    engineered_cols = []
     if CONFIG['use_angular_velocity']:
-        engineered_cols.extend(['ang_vel_x', 'ang_vel_y', 'ang_vel_z'])
+        engineered_cols.extend(['ang_vel_x', 'ang_vel_y', 'ang_vel_z', 'angular_vel_mag', 'angular_vel_mag_jerk'])
     if CONFIG['use_angular_distance']:
         engineered_cols.append('angular_distance')
     if CONFIG['use_statistical_features']:
         engineered_cols.extend(['linear_acc_mag', 'linear_acc_mag_jerk',
                               'jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
-                              'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle'])
+                              'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle',
+                              'gesture_rhythm_signature'])
     
-    feature_cols = base_feature_cols + engineered_cols
+    # Collect thermopile and ToF features
+    thm_cols = [col for col in df.columns if col.startswith('thm_')]
+    tof_cols = [col for col in df.columns if col.startswith('tof_')]
+    
+    # Build feature_cols in the correct order for the model
+    feature_cols = imu_base_cols + engineered_cols + thm_cols + tof_cols
     print(f"\nTotal features: {len(feature_cols)}")
-    print(f"Base features: {len(base_feature_cols)}")
-    print(f"Engineered features: {len(engineered_cols)}")
+    print(f"IMU features: {len(imu_base_cols)} base + {len(engineered_cols)} engineered = {len(imu_base_cols) + len(engineered_cols)}")
+    print(f"Thermopile features: {len(thm_cols)}")
+    print(f"ToF features: {len(tof_cols)}")
     
     # Create variable length sequences
     print("\n Creating variable length sequences...")
-    X, y_binary, y_multi, seq_lengths, seq_ids = create_variable_sequences(
+    X, y_binary, y_multi, seq_lengths, seq_ids, subject_ids = create_variable_sequences(
         df, feature_cols
     )
     
@@ -841,15 +995,38 @@ def main():
     
     # Only do cross-validation if we have real labels
     if 'gesture' in df.columns:
-        # Cross-validation
+        # Cross-validation with subject-aware splitting
         print("\n Starting cross-validation...")
-        skf = StratifiedKFold(n_splits=CONFIG['n_folds'], shuffle=True, random_state=CONFIG['seed'])
+        
+        # Use actual subject IDs from data (prevents data leakage)
+        unique_subjects = np.unique(subject_ids)
+        print(f"\nUnique subjects found: {len(unique_subjects)}")
+        
+        # Choose cross-validation strategy based on available options and data
+        if StratifiedGroupKFold is not None and len(unique_subjects) > CONFIG['n_folds']:
+            # Best option: Group by subject, stratify by gesture
+            print("Using StratifiedGroupKFold (group by subject, stratify by gesture)")
+            cv = StratifiedGroupKFold(n_splits=CONFIG['n_folds'], shuffle=True, random_state=CONFIG['seed'])
+            splits = list(cv.split(X, y_multi, groups=subject_ids))
+        elif len(unique_subjects) > CONFIG['n_folds']:
+            # Second best: Group by subject (no stratification)
+            print("Using GroupKFold (group by subject, no gesture stratification)")
+            cv = GroupKFold(n_splits=CONFIG['n_folds'])
+            splits = list(cv.split(X, groups=subject_ids))
+        else:
+            # Fallback: Regular stratified split
+            print("Using StratifiedKFold (not enough subjects for grouping)")
+            cv = StratifiedKFold(n_splits=CONFIG['n_folds'], shuffle=True, random_state=CONFIG['seed'])
+            splits = list(cv.split(X, y_multi))
+        
         cv_scores = []
         
-        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y_multi)):
-            print(f"\n{'='*60}")
-            print(f"FOLD {fold + 1}/{CONFIG['n_folds']}")
-            print(f"{'='*60}")
+        # Calculate class weights for loss function
+        labels_for_weights = y_multi
+        class_weights = compute_class_weight('balanced', classes=np.unique(labels_for_weights), y=labels_for_weights)
+        
+        for fold, (train_idx, val_idx) in enumerate(splits):
+            print(f"\n[FOLD {fold + 1}/{CONFIG['n_folds']}]")
             
             # Split data
             X_train = [X[i] for i in train_idx]
@@ -859,28 +1036,52 @@ def main():
             seq_lengths_train = seq_lengths[train_idx]
             seq_lengths_val = seq_lengths[val_idx]
             
-            # Normalize each sequence independently
-            # Use StandardScaler for better compatibility with test distribution
-            scaler = StandardScaler()
+            # Debug: Check split sizes
+            print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
             
-            # Fit scaler on concatenated training data
+            # Skip fold if validation set is too small
+            if len(X_val) < CONFIG['batch_size']:
+                print(f"WARNING: Validation set too small ({len(X_val)} < {CONFIG['batch_size']}), skipping fold {fold + 1}")
+                continue
+            
+            # CRITICAL FIX: Use separate scalers for IMU vs other sensors
+            # This preserves the natural relationships between different sensor types
+            n_imu_features = 7 + (5 if CONFIG['use_angular_velocity'] else 0) + \
+                           (1 if CONFIG['use_angular_distance'] else 0) + \
+                           (14 if CONFIG['use_statistical_features'] else 0)
+            
+            # Create separate scalers
+            imu_scaler = StandardScaler()
+            other_scaler = StandardScaler()
+            
+            # Fit scalers on concatenated training data
             X_train_concat = np.vstack(X_train)
             X_train_concat = np.nan_to_num(X_train_concat, nan=0.0, posinf=0.0, neginf=0.0)
-            scaler.fit(X_train_concat)
             
-            # Apply scaling to each sequence
+            # Fit IMU scaler on IMU features only
+            imu_scaler.fit(X_train_concat[:, :n_imu_features])
+            # Fit other scaler on ToF and thermopile features
+            other_scaler.fit(X_train_concat[:, n_imu_features:])
+            
+            # Apply dual scaling to each sequence - NO CLIPPING!
             X_train_scaled = []
             for seq in X_train:
                 seq_clean = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0)
-                seq_scaled = scaler.transform(seq_clean)
-                seq_scaled = np.clip(seq_scaled, -10, 10)
+                # Scale IMU and other features separately
+                seq_imu_scaled = imu_scaler.transform(seq_clean[:, :n_imu_features])
+                seq_other_scaled = other_scaler.transform(seq_clean[:, n_imu_features:])
+                seq_scaled = np.concatenate([seq_imu_scaled, seq_other_scaled], axis=1)
+                # REMOVED CLIPPING - this was destroying information!
                 X_train_scaled.append(seq_scaled)
             
             X_val_scaled = []
             for seq in X_val:
                 seq_clean = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0)
-                seq_scaled = scaler.transform(seq_clean)
-                seq_scaled = np.clip(seq_scaled, -10, 10)
+                # Scale IMU and other features separately
+                seq_imu_scaled = imu_scaler.transform(seq_clean[:, :n_imu_features])
+                seq_other_scaled = other_scaler.transform(seq_clean[:, n_imu_features:])
+                seq_scaled = np.concatenate([seq_imu_scaled, seq_other_scaled], axis=1)
+                # REMOVED CLIPPING - this was destroying information!
                 X_val_scaled.append(seq_scaled)
             
             # Create datasets
@@ -902,8 +1103,15 @@ def main():
                 shuffle=False,
                 num_workers=CONFIG['num_workers'],
                 pin_memory=True,
-                collate_fn=collate_fn
+                collate_fn=collate_fn,
+                drop_last=False  # Keep all samples even if last batch is smaller
             )
+            
+            # Check if loaders have data
+            print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+            if len(val_loader) == 0:
+                print(f"ERROR: Validation loader has no batches! Val samples: {len(X_val)}")
+                continue
             
             # Initialize model
             n_classes = len(label_encoder.classes_) if label_encoder else 18
@@ -945,36 +1153,42 @@ def main():
             for epoch in range(CONFIG['max_epochs']):
                 print(f"\nEpoch {epoch + 1}/{CONFIG['max_epochs']}")
                 
-                # Train
+                # Train with IMU-only augmentation
                 train_loss = train_epoch(
                     model, train_loader, criterion_binary, criterion_multi, 
-                    optimizer, CONFIG['device'], use_mixup=True
+                    optimizer, CONFIG['device'], use_mixup=True,
+                    imu_only_prob=CONFIG['imu_only_train_prob']
                 )
                 train_losses.append(train_loss)
                 
-                # Validate
-                val_metrics = validate(model, val_loader, CONFIG['device'], criterion_binary, criterion_multi)
-                val_scores.append(val_metrics['competition_score'])
-                val_losses.append(val_metrics['val_loss'])
+                # Validate using dual evaluation
+                val_metrics = validate_dual(model, val_loader, CONFIG['device'], criterion_binary, criterion_multi)
                 
-                print(f"Train Loss: {train_loss:.4f}")
-                print(f"Val Loss: {val_metrics['val_loss']:.4f}")
-                print(f"Val Binary F1: {val_metrics['binary_f1']:.4f}")
-                print(f"Val Multi F1: {val_metrics['multi_f1']:.4f}")
-                print(f"Val Score: {val_metrics['competition_score']:.4f}")
+                # Track the realistic composite score (average of full and IMU-only)
+                val_scores.append(val_metrics['realistic_competition_score'])
+                val_losses.append(val_metrics['realistic_val_loss'])
+                
+                # Compact output format
+                print(f"Loss: Train={train_loss:.4f} Val={val_metrics['realistic_val_loss']:.4f} | "
+                      f"Full: {val_metrics['full_sensor']['competition_score']:.4f} | "
+                      f"IMU: {val_metrics['imu_only']['competition_score']:.4f} | "
+                      f"Mixed: {val_metrics['mixed_50_50']['competition_score']:.4f} | "
+                      f"Score: {val_metrics['realistic_competition_score']:.4f}")
                 
                 # Learning rate scheduling
                 scheduler.step()
                 
-                # Save best model
-                if val_metrics['competition_score'] > best_score:
-                    best_score = val_metrics['competition_score']
+                # Save best model based on realistic composite score
+                if val_metrics['realistic_competition_score'] > best_score:
+                    best_score = val_metrics['realistic_competition_score']
                     best_epoch = epoch
                     patience_counter = 0
                     
                     torch.save({
                         'model_state_dict': model.state_dict(),
-                        'scaler': scaler,
+                        'imu_scaler': imu_scaler,
+                        'other_scaler': other_scaler,
+                        'n_imu_features': n_imu_features,
                         'label_encoder': label_encoder,
                         'score': best_score,
                         'epoch': epoch,

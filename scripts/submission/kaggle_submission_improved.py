@@ -207,6 +207,19 @@ class FeatureEngineer:
             angular_vel = FeatureEngineer.calculate_angular_velocity(rot_data)
             seq_data[['ang_vel_x', 'ang_vel_y', 'ang_vel_z']] = angular_vel
             
+            # Angular velocity magnitude
+            seq_data['angular_vel_mag'] = np.sqrt(
+                angular_vel[:, 0]**2 + angular_vel[:, 1]**2 + angular_vel[:, 2]**2
+            )
+            
+            # Angular velocity magnitude jerk
+            seq_data['angular_vel_mag_jerk'] = seq_data['angular_vel_mag'].diff().fillna(0)
+            
+            # Gesture rhythm signature - key discriminative feature
+            seq_data['gesture_rhythm_signature'] = seq_data['linear_acc_mag'].rolling(
+                5, min_periods=1
+            ).std() / (seq_data['linear_acc_mag'].rolling(5, min_periods=1).mean() + 1e-6)
+            
             # Angular distance (frame-to-frame, not cumulative)
             seq_data['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
             
@@ -297,13 +310,13 @@ class ImprovedBFRBModel(nn.Module):
         self.n_engineered_features = 0
         
         if CONFIG['use_angular_velocity']:
-            self.n_engineered_features += 3
+            self.n_engineered_features += 5  # ang_vel(3) + mag(1) + mag_jerk(1)
         if CONFIG['use_angular_distance']:
             self.n_engineered_features += 1
         if CONFIG['use_statistical_features']:
             # Now includes: linear_acc(3) + linear_acc_mag(1) + linear_acc_mag_jerk(1) + 
-            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) = 13
-            self.n_engineered_features += 13
+            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) + rhythm_sig(1) = 14
+            self.n_engineered_features += 14
             
         self.n_imu_total = self.n_imu_features + self.n_engineered_features
         self.n_thm_features = 5
@@ -420,7 +433,7 @@ class ImprovedBFRBModel(nn.Module):
         
         return mask.float()
     
-    def forward(self, x, lengths=None):
+    def forward(self, x, lengths=None, sensor_mask=None):
         batch_size = x.size(0)
         seq_len = x.size(2)
         
@@ -428,6 +441,13 @@ class ImprovedBFRBModel(nn.Module):
         imu_data = x[:, :self.n_imu_total, :]
         thm_data = x[:, self.n_imu_total:self.n_imu_total+self.n_thm_features, :]
         tof_data = x[:, self.n_imu_total+self.n_thm_features:, :]
+        
+        # Apply sensor masking if provided (for IMU-only sequences)
+        if sensor_mask is not None:
+            # sensor_mask is a boolean tensor where True = IMU-only
+            # Zero out non-IMU sensors for masked samples
+            thm_data = thm_data * (~sensor_mask).float().unsqueeze(1).unsqueeze(2)
+            tof_data = tof_data * (~sensor_mask).float().unsqueeze(1).unsqueeze(2)
         
         # Encode each sensor type
         imu_features = self.imu_encoder(imu_data)
@@ -532,7 +552,19 @@ class BFRBPredictor:
             model.eval()
             
             self.models.append(model)
-            self.scalers.append(checkpoint['scaler'])
+            
+            # Handle both old (single scaler) and new (dual scaler) formats
+            if 'imu_scaler' in checkpoint and 'other_scaler' in checkpoint:
+                # New dual scaler format
+                self.scalers.append({
+                    'imu_scaler': checkpoint['imu_scaler'],
+                    'other_scaler': checkpoint['other_scaler'],
+                    'n_imu_features': checkpoint['n_imu_features']
+                })
+            else:
+                # Old single scaler format for compatibility
+                self.scalers.append(checkpoint['scaler'])
+                
             self.label_encoders.append(label_encoder)
         
         print(f"Loaded {len(self.models)} models for ensemble")
@@ -562,21 +594,34 @@ class BFRBPredictor:
         if self.feature_cols is None:
             # This should not happen if models are loaded correctly
             # But provide fallback that matches the training script
-            base_feature_cols = [col for col in df.columns if col.startswith(('linear_acc_', 'rot_', 'thm_', 'tof_'))]
-            # Keep acc_ columns for compatibility but they shouldn't be primary features
-            base_feature_cols += [col for col in df.columns if col.startswith('acc_') and col not in base_feature_cols]
+            # Feature columns - MUST match model's expected order:
+            # 1. IMU features (linear_acc, rot, then engineered)
+            # 2. Thermopile features (thm_)
+            # 3. ToF features (tof_)
             
+            # Collect IMU base features
+            imu_base_cols = []
+            imu_base_cols += [col for col in df.columns if col.startswith('linear_acc_')]
+            imu_base_cols += [col for col in df.columns if col.startswith('rot_')]
+            
+            # Collect engineered IMU features
             engineered_cols = []
             if CONFIG['use_angular_velocity']:
-                engineered_cols.extend(['ang_vel_x', 'ang_vel_y', 'ang_vel_z'])
+                engineered_cols.extend(['ang_vel_x', 'ang_vel_y', 'ang_vel_z', 'angular_vel_mag', 'angular_vel_mag_jerk'])
             if CONFIG['use_angular_distance']:
                 engineered_cols.append('angular_distance')
             if CONFIG['use_statistical_features']:
                 engineered_cols.extend(['linear_acc_mag', 'linear_acc_mag_jerk',
                                       'jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
-                                      'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle'])
+                                      'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle',
+                                      'gesture_rhythm_signature'])
             
-            self.feature_cols = base_feature_cols + engineered_cols
+            # Collect thermopile and ToF features
+            thm_cols = [col for col in df.columns if col.startswith('thm_')]
+            tof_cols = [col for col in df.columns if col.startswith('tof_')]
+            
+            # Build feature_cols in the correct order for the model
+            self.feature_cols = imu_base_cols + engineered_cols + thm_cols + tof_cols
         
         # Extract features
         features = df[self.feature_cols].values
@@ -592,15 +637,39 @@ class BFRBPredictor:
         scaler = self.scalers[model_idx]
         
         # Scale features
-        features_scaled = scaler.transform(features)
-        features_scaled = np.clip(features_scaled, -10, 10)
+        if isinstance(scaler, dict) and 'imu_scaler' in scaler:
+            # New dual scaler format
+            n_imu = scaler['n_imu_features']
+            features_imu_scaled = scaler['imu_scaler'].transform(features[:, :n_imu])
+            features_other_scaled = scaler['other_scaler'].transform(features[:, n_imu:])
+            features_scaled = np.concatenate([features_imu_scaled, features_other_scaled], axis=1)
+            # NO CLIPPING - removed the harmful clipping
+        else:
+            # Old single scaler format
+            features_scaled = scaler.transform(features)
+            features_scaled = np.clip(features_scaled, -10, 10)  # Keep for old models
         
         # Convert to tensor and add batch dimension
         sequence_tensor = torch.FloatTensor(features_scaled.T).unsqueeze(0).to(self.device)
         
+        # Detect if this is an IMU-only sequence
+        # Check if thermopile and ToF features are all zeros or very small
+        n_imu = self.models[model_idx].n_imu_total
+        n_thm = self.models[model_idx].n_thm_features
+        
+        # Check if non-IMU features are missing (all zeros or very small values)
+        non_imu_features = features_scaled[:, n_imu:]
+        is_imu_only = np.abs(non_imu_features).max() < 0.01  # Threshold for "zero"
+        
+        # Create sensor mask for the model
+        if is_imu_only:
+            sensor_mask = torch.tensor([True]).to(self.device)  # IMU-only
+        else:
+            sensor_mask = None  # All sensors available
+        
         # Predict
         with torch.no_grad():
-            outputs = model(sequence_tensor)
+            outputs = model(sequence_tensor, sensor_mask=sensor_mask)
             
             # Get probabilities
             binary_probs = F.softmax(outputs['binary'], dim=1).cpu().numpy()
