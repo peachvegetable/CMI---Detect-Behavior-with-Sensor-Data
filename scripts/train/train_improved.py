@@ -30,7 +30,8 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.nn.utils.rnn import pad_sequence
 
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder, RobustScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from scipy.spatial.transform import Rotation as R
 from sklearn.metrics import f1_score, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -80,44 +81,110 @@ class FeatureEngineer:
     """Advanced feature engineering for sensor data"""
     
     @staticmethod
+    def remove_gravity_from_acc(acc_data, rot_data):
+        """Remove gravity from accelerometer data using quaternion rotation"""
+        if isinstance(acc_data, pd.DataFrame):
+            acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
+        else:
+            acc_values = acc_data
+        
+        if isinstance(rot_data, pd.DataFrame):
+            # Note: rot_data columns are [rot_w, rot_x, rot_y, rot_z]
+            # scipy expects [x, y, z, w] format
+            quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w]
+            quat_values = rot_data[:, [1, 2, 3, 0]]
+        
+        num_samples = acc_values.shape[0]
+        linear_accel = np.zeros_like(acc_values)
+        gravity_world = np.array([0, 0, 9.81])
+        
+        for i in range(num_samples):
+            if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
+                linear_accel[i, :] = acc_values[i, :]
+                continue
+            
+            try:
+                rotation = R.from_quat(quat_values[i])
+                gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
+                linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
+            except ValueError:
+                linear_accel[i, :] = acc_values[i, :]
+        
+        return linear_accel
+    
+    @staticmethod
     def calculate_angular_velocity(rotation_data, time_diff=0.02):
         """
-        Calculate angular velocity from quaternion data
-        rotation_data: (timesteps, 4) array of quaternions [w, x, y, z]
+        Calculate angular velocity from quaternion data using scipy
+        rotation_data: (timesteps, 4) array of quaternions [w, x, y, z] or dataframe
         """
-        angular_vel = np.zeros((len(rotation_data) - 1, 3))
+        if isinstance(rotation_data, pd.DataFrame):
+            quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
+            quat_values = rotation_data[:, [1, 2, 3, 0]]
         
-        for i in range(len(rotation_data) - 1):
-            q1 = rotation_data[i]
-            q2 = rotation_data[i + 1]
+        num_samples = quat_values.shape[0]
+        angular_vel = np.zeros((num_samples, 3))
+        
+        for i in range(num_samples - 1):
+            q_t = quat_values[i]
+            q_t_plus_dt = quat_values[i + 1]
             
-            # Quaternion difference
-            q_diff = quaternion_multiply(q2, quaternion_conjugate(q1))
+            if np.all(np.isnan(q_t)) or np.all(np.isclose(q_t, 0)) or \
+               np.all(np.isnan(q_t_plus_dt)) or np.all(np.isclose(q_t_plus_dt, 0)):
+                continue
             
-            # Convert to axis-angle
-            angle = 2 * np.arccos(np.clip(q_diff[0], -1, 1))
-            if angle > 0:
-                axis = q_diff[1:] / np.sin(angle / 2)
-                angular_vel[i] = axis * angle / time_diff
-            
-        # Pad to match original length
-        angular_vel = np.vstack([angular_vel, angular_vel[-1]])
+            try:
+                rot_t = R.from_quat(q_t)
+                rot_t_plus_dt = R.from_quat(q_t_plus_dt)
+                
+                # Calculate relative rotation
+                delta_rot = rot_t.inv() * rot_t_plus_dt
+                
+                # Convert to angular velocity
+                angular_vel[i, :] = delta_rot.as_rotvec() / time_diff
+            except ValueError:
+                pass
+        
         return angular_vel
     
     @staticmethod
     def calculate_angular_distance(rotation_data):
-        """Calculate cumulative angular distance traveled"""
-        angular_dist = np.zeros(len(rotation_data))
+        """Calculate frame-to-frame angular distance (not cumulative)"""
+        if isinstance(rotation_data, pd.DataFrame):
+            quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
+            quat_values = rotation_data[:, [1, 2, 3, 0]]
         
-        for i in range(1, len(rotation_data)):
-            q1 = rotation_data[i - 1]
-            q2 = rotation_data[i]
+        num_samples = quat_values.shape[0]
+        angular_dist = np.zeros(num_samples)
+        
+        for i in range(num_samples - 1):
+            q1 = quat_values[i]
+            q2 = quat_values[i + 1]
             
-            # Quaternion dot product gives cos(theta/2)
-            dot = np.clip(np.dot(q1, q2), -1, 1)
-            angle = 2 * np.arccos(np.abs(dot))
-            angular_dist[i] = angular_dist[i - 1] + angle
+            if np.all(np.isnan(q1)) or np.all(np.isclose(q1, 0)) or \
+               np.all(np.isnan(q2)) or np.all(np.isclose(q2, 0)):
+                angular_dist[i] = 0
+                continue
             
+            try:
+                r1 = R.from_quat(q1)
+                r2 = R.from_quat(q2)
+                
+                # Calculate relative rotation
+                relative_rotation = r1.inv() * r2
+                
+                # Angle is the norm of the rotation vector
+                angle = np.linalg.norm(relative_rotation.as_rotvec())
+                angular_dist[i] = angle
+            except ValueError:
+                angular_dist[i] = 0
+        
         return angular_dist
     
     @staticmethod
@@ -158,18 +225,28 @@ class FeatureEngineer:
             acc_data = seq_data[['acc_x', 'acc_y', 'acc_z']].values
             rot_data = seq_data[['rot_w', 'rot_x', 'rot_y', 'rot_z']].values
             
+            # Remove gravity from acceleration first
+            linear_accel = FeatureEngineer.remove_gravity_from_acc(acc_data, rot_data)
+            seq_data[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = linear_accel
+            
+            # Calculate magnitude of linear acceleration (without gravity)
+            seq_data['linear_acc_mag'] = np.linalg.norm(linear_accel, axis=1)
+            
+            # Calculate jerk from linear acceleration magnitude
+            seq_data['linear_acc_mag_jerk'] = seq_data['linear_acc_mag'].diff().fillna(0)
+            
             # Angular velocity
             angular_vel = FeatureEngineer.calculate_angular_velocity(rot_data)
             seq_data[['ang_vel_x', 'ang_vel_y', 'ang_vel_z']] = angular_vel
             
-            # Angular distance
+            # Angular distance (frame-to-frame, not cumulative)
             seq_data['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
             
-            # Jerk
-            jerk = FeatureEngineer.calculate_jerk(acc_data)
+            # Jerk from linear acceleration (not raw acceleration)
+            jerk = FeatureEngineer.calculate_jerk(linear_accel)
             seq_data[['jerk_x', 'jerk_y', 'jerk_z']] = jerk
             
-            # Acceleration magnitude
+            # Keep original acceleration magnitude for compatibility
             seq_data['acc_magnitude'] = np.linalg.norm(acc_data, axis=1)
             
             # MAD features
@@ -184,22 +261,7 @@ class FeatureEngineer:
         return pd.concat(engineered_features, ignore_index=True)
 
 
-# Helper functions for quaternion math
-def quaternion_conjugate(q):
-    """Return conjugate of quaternion"""
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-def quaternion_multiply(q1, q2):
-    """Multiply two quaternions"""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    
-    return np.array([w, x, y, z])
+# Note: Quaternion helper functions are no longer needed as we use scipy.spatial.transform.Rotation
 
 
 # ===== MODEL ARCHITECTURE (same as before) =====
@@ -258,7 +320,7 @@ class ImprovedBFRBModel(nn.Module):
         super().__init__()
         
         # Calculate feature splits
-        self.n_imu_features = 7  # Base IMU features
+        self.n_imu_features = 7  # Base IMU features (now includes linear_acc instead of raw acc)
         self.n_engineered_features = 0
         
         if CONFIG['use_angular_velocity']:
@@ -266,7 +328,9 @@ class ImprovedBFRBModel(nn.Module):
         if CONFIG['use_angular_distance']:
             self.n_engineered_features += 1
         if CONFIG['use_statistical_features']:
-            self.n_engineered_features += 8  # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1)
+            # Now includes: linear_acc(3) + linear_acc_mag(1) + linear_acc_mag_jerk(1) + 
+            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) = 13
+            self.n_engineered_features += 13
             
         self.n_imu_total = self.n_imu_features + self.n_engineered_features
         self.n_thm_features = 5
@@ -746,7 +810,10 @@ def main():
         label_encoder = None
     
     # Feature columns (including engineered features)
-    base_feature_cols = [col for col in df.columns if col.startswith(('acc_', 'rot_', 'thm_', 'tof_'))]
+    # Note: We now use linear_acc instead of raw acc for better feature representation
+    base_feature_cols = [col for col in df.columns if col.startswith(('linear_acc_', 'rot_', 'thm_', 'tof_'))]
+    # Keep acc_ columns for compatibility but they shouldn't be primary features
+    base_feature_cols += [col for col in df.columns if col.startswith('acc_') and col not in base_feature_cols]
     engineered_cols = []
     
     if CONFIG['use_angular_velocity']:
@@ -754,7 +821,8 @@ def main():
     if CONFIG['use_angular_distance']:
         engineered_cols.append('angular_distance')
     if CONFIG['use_statistical_features']:
-        engineered_cols.extend(['jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
+        engineered_cols.extend(['linear_acc_mag', 'linear_acc_mag_jerk',
+                              'jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
                               'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle'])
     
     feature_cols = base_feature_cols + engineered_cols
@@ -792,7 +860,8 @@ def main():
             seq_lengths_val = seq_lengths[val_idx]
             
             # Normalize each sequence independently
-            scaler = RobustScaler()
+            # Use StandardScaler for better compatibility with test distribution
+            scaler = StandardScaler()
             
             # Fit scaler on concatenated training data
             X_train_concat = np.vstack(X_train)

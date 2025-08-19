@@ -1,10 +1,3 @@
-"""
-KAGGLE SUBMISSION - IMPROVED MODEL WITH FEATURE ENGINEERING
-===========================================================
-Copy this entire code into a Kaggle notebook cell
-Requires model files: improved_model_fold_0.pth through improved_model_fold_4.pth
-"""
-
 import os
 import sys
 import numpy as np
@@ -13,7 +6,8 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler
+from scipy.spatial.transform import Rotation as R
 import pickle
 import gc
 
@@ -45,41 +39,107 @@ class FeatureEngineer:
     """Advanced feature engineering for sensor data"""
     
     @staticmethod
-    def calculate_angular_velocity(rotation_data, time_diff=0.02):
-        """Calculate angular velocity from quaternion data"""
-        angular_vel = np.zeros((len(rotation_data) - 1, 3))
+    def remove_gravity_from_acc(acc_data, rot_data):
+        """Remove gravity from accelerometer data using quaternion rotation"""
+        if isinstance(acc_data, pd.DataFrame):
+            acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
+        else:
+            acc_values = acc_data
         
-        for i in range(len(rotation_data) - 1):
-            q1 = rotation_data[i]
-            q2 = rotation_data[i + 1]
+        if isinstance(rot_data, pd.DataFrame):
+            # Note: rot_data columns are [rot_w, rot_x, rot_y, rot_z]
+            # scipy expects [x, y, z, w] format
+            quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w]
+            quat_values = rot_data[:, [1, 2, 3, 0]]
+        
+        num_samples = acc_values.shape[0]
+        linear_accel = np.zeros_like(acc_values)
+        gravity_world = np.array([0, 0, 9.81])
+        
+        for i in range(num_samples):
+            if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
+                linear_accel[i, :] = acc_values[i, :]
+                continue
             
-            # Quaternion difference
-            q_diff = quaternion_multiply(q2, quaternion_conjugate(q1))
+            try:
+                rotation = R.from_quat(quat_values[i])
+                gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
+                linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
+            except ValueError:
+                linear_accel[i, :] = acc_values[i, :]
+        
+        return linear_accel
+    
+    @staticmethod
+    def calculate_angular_velocity(rotation_data, time_diff=0.02):
+        """Calculate angular velocity from quaternion data using scipy"""
+        if isinstance(rotation_data, pd.DataFrame):
+            quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
+            quat_values = rotation_data[:, [1, 2, 3, 0]]
+        
+        num_samples = quat_values.shape[0]
+        angular_vel = np.zeros((num_samples, 3))
+        
+        for i in range(num_samples - 1):
+            q_t = quat_values[i]
+            q_t_plus_dt = quat_values[i + 1]
             
-            # Convert to axis-angle
-            angle = 2 * np.arccos(np.clip(q_diff[0], -1, 1))
-            if angle > 0:
-                axis = q_diff[1:] / np.sin(angle / 2)
-                angular_vel[i] = axis * angle / time_diff
+            if np.all(np.isnan(q_t)) or np.all(np.isclose(q_t, 0)) or \
+               np.all(np.isnan(q_t_plus_dt)) or np.all(np.isclose(q_t_plus_dt, 0)):
+                continue
             
-        # Pad to match original length
-        angular_vel = np.vstack([angular_vel, angular_vel[-1]])
+            try:
+                rot_t = R.from_quat(q_t)
+                rot_t_plus_dt = R.from_quat(q_t_plus_dt)
+                
+                # Calculate relative rotation
+                delta_rot = rot_t.inv() * rot_t_plus_dt
+                
+                # Convert to angular velocity
+                angular_vel[i, :] = delta_rot.as_rotvec() / time_diff
+            except ValueError:
+                pass
+        
         return angular_vel
     
     @staticmethod
     def calculate_angular_distance(rotation_data):
-        """Calculate cumulative angular distance traveled"""
-        angular_dist = np.zeros(len(rotation_data))
+        """Calculate frame-to-frame angular distance (not cumulative)"""
+        if isinstance(rotation_data, pd.DataFrame):
+            quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        else:
+            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
+            quat_values = rotation_data[:, [1, 2, 3, 0]]
         
-        for i in range(1, len(rotation_data)):
-            q1 = rotation_data[i - 1]
-            q2 = rotation_data[i]
+        num_samples = quat_values.shape[0]
+        angular_dist = np.zeros(num_samples)
+        
+        for i in range(num_samples - 1):
+            q1 = quat_values[i]
+            q2 = quat_values[i + 1]
             
-            # Quaternion dot product gives cos(theta/2)
-            dot = np.clip(np.dot(q1, q2), -1, 1)
-            angle = 2 * np.arccos(np.abs(dot))
-            angular_dist[i] = angular_dist[i - 1] + angle
+            if np.all(np.isnan(q1)) or np.all(np.isclose(q1, 0)) or \
+               np.all(np.isnan(q2)) or np.all(np.isclose(q2, 0)):
+                angular_dist[i] = 0
+                continue
             
+            try:
+                r1 = R.from_quat(q1)
+                r2 = R.from_quat(q2)
+                
+                # Calculate relative rotation
+                relative_rotation = r1.inv() * r2
+                
+                # Angle is the norm of the rotation vector
+                angle = np.linalg.norm(relative_rotation.as_rotvec())
+                angular_dist[i] = angle
+            except ValueError:
+                angular_dist[i] = 0
+        
         return angular_dist
     
     @staticmethod
@@ -110,55 +170,73 @@ class FeatureEngineer:
     
     @staticmethod
     def engineer_features_polars(df, window_size=10):
-        """Apply feature engineering to polars dataframe"""
+        """Apply feature engineering to polars dataframe - MUST match training!"""
         # Convert to pandas for easier manipulation
         df_pd = df.to_pandas()
         
-        # Extract base features
-        acc_data = df_pd[['acc_x', 'acc_y', 'acc_z']].values
-        rot_data = df_pd[['rot_w', 'rot_x', 'rot_y', 'rot_z']].values
+        # CRITICAL: Process each sequence separately to match training
+        engineered_features = []
         
-        # Angular velocity
-        angular_vel = FeatureEngineer.calculate_angular_velocity(rot_data)
-        df_pd[['ang_vel_x', 'ang_vel_y', 'ang_vel_z']] = angular_vel
+        # Get unique sequence IDs (should be just one for inference)
+        sequence_ids = df_pd['sequence_id'].unique() if 'sequence_id' in df_pd.columns else [0]
         
-        # Angular distance
-        df_pd['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
+        for seq_id in sequence_ids:
+            # Extract sequence data
+            if 'sequence_id' in df_pd.columns:
+                seq_data = df_pd[df_pd['sequence_id'] == seq_id].copy()
+            else:
+                # If no sequence_id column, treat entire dataframe as one sequence
+                seq_data = df_pd.copy()
+                seq_data['sequence_id'] = 0
+            
+            # Extract base features
+            acc_data = seq_data[['acc_x', 'acc_y', 'acc_z']].values
+            rot_data = seq_data[['rot_w', 'rot_x', 'rot_y', 'rot_z']].values
+            
+            # Remove gravity from acceleration first (CRITICAL!)
+            linear_accel = FeatureEngineer.remove_gravity_from_acc(acc_data, rot_data)
+            seq_data[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = linear_accel
+            
+            # Calculate magnitude of linear acceleration (without gravity)
+            seq_data['linear_acc_mag'] = np.linalg.norm(linear_accel, axis=1)
+            
+            # Calculate jerk from linear acceleration magnitude
+            seq_data['linear_acc_mag_jerk'] = seq_data['linear_acc_mag'].diff().fillna(0)
+            
+            # Angular velocity
+            angular_vel = FeatureEngineer.calculate_angular_velocity(rot_data)
+            seq_data[['ang_vel_x', 'ang_vel_y', 'ang_vel_z']] = angular_vel
+            
+            # Angular distance (frame-to-frame, not cumulative)
+            seq_data['angular_distance'] = FeatureEngineer.calculate_angular_distance(rot_data)
+            
+            # Jerk from linear acceleration (not raw acceleration)
+            jerk = FeatureEngineer.calculate_jerk(linear_accel)
+            seq_data[['jerk_x', 'jerk_y', 'jerk_z']] = jerk
+            
+            # Keep original acceleration magnitude for compatibility
+            seq_data['acc_magnitude'] = np.linalg.norm(acc_data, axis=1)
+            
+            # MAD features (still using raw acc for compatibility)
+            acc_mad = FeatureEngineer.calculate_mad(acc_data, window_size)
+            seq_data[['acc_mad_x', 'acc_mad_y', 'acc_mad_z']] = acc_mad
+            
+            # Rotation angle from quaternion
+            seq_data['rotation_angle'] = 2 * np.arccos(np.clip(rot_data[:, 0], -1, 1))
+            
+            engineered_features.append(seq_data)
         
-        # Jerk
-        jerk = FeatureEngineer.calculate_jerk(acc_data)
-        df_pd[['jerk_x', 'jerk_y', 'jerk_z']] = jerk
-        
-        # Acceleration magnitude
-        df_pd['acc_magnitude'] = np.linalg.norm(acc_data, axis=1)
-        
-        # MAD features
-        acc_mad = FeatureEngineer.calculate_mad(acc_data, window_size)
-        df_pd[['acc_mad_x', 'acc_mad_y', 'acc_mad_z']] = acc_mad
-        
-        # Rotation angle from quaternion
-        df_pd['rotation_angle'] = 2 * np.arccos(np.clip(rot_data[:, 0], -1, 1))
+        # Concatenate all sequences
+        if len(engineered_features) > 1:
+            df_pd = pd.concat(engineered_features, ignore_index=True)
+        else:
+            df_pd = engineered_features[0]
         
         # Convert back to polars
         return pl.from_pandas(df_pd)
 
 
-# Helper functions for quaternion math
-def quaternion_conjugate(q):
-    """Return conjugate of quaternion"""
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-def quaternion_multiply(q1, q2):
-    """Multiply two quaternions"""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    
-    return np.array([w, x, y, z])
+# Note: Quaternion helper functions are no longer needed as we use scipy.spatial.transform.Rotation
 
 
 # ===== MODEL ARCHITECTURE =====
@@ -215,7 +293,7 @@ class ImprovedBFRBModel(nn.Module):
         super().__init__()
         
         # Calculate feature splits
-        self.n_imu_features = 7  # Base IMU features
+        self.n_imu_features = 7  # Base IMU features (now includes linear_acc instead of raw acc)
         self.n_engineered_features = 0
         
         if CONFIG['use_angular_velocity']:
@@ -223,7 +301,9 @@ class ImprovedBFRBModel(nn.Module):
         if CONFIG['use_angular_distance']:
             self.n_engineered_features += 1
         if CONFIG['use_statistical_features']:
-            self.n_engineered_features += 8  # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1)
+            # Now includes: linear_acc(3) + linear_acc_mag(1) + linear_acc_mag_jerk(1) + 
+            # jerk(3) + acc_mad(3) + acc_mag(1) + rot_angle(1) = 13
+            self.n_engineered_features += 13
             
         self.n_imu_total = self.n_imu_features + self.n_engineered_features
         self.n_thm_features = 5
@@ -270,12 +350,11 @@ class ImprovedBFRBModel(nn.Module):
             ResidualBlock(768, 1024),
         )
         
-        # Global context attention
-        self.attention = nn.Sequential(
+        # Global context attention (without final softmax for masking)
+        self.attention_conv = nn.Sequential(
             nn.Conv1d(1024, 128, kernel_size=1),
             nn.Tanh(),
-            nn.Conv1d(128, 1, kernel_size=1),
-            nn.Softmax(dim=2)
+            nn.Conv1d(128, 1, kernel_size=1)
         )
         
         # Shared fully connected layers
@@ -311,8 +390,40 @@ class ImprovedBFRBModel(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(256, n_classes)
         )
+        
+        self._initialize_weights()
     
-    def forward(self, x):
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def create_attention_mask(self, seq_len, lengths):
+        """Create attention mask for padded sequences"""
+        batch_size = lengths.size(0)
+        max_len = seq_len
+        
+        # Create a tensor of sequence positions
+        seq_range = torch.arange(0, max_len).to(lengths.device)
+        seq_range = seq_range.unsqueeze(0).expand(batch_size, max_len)
+        
+        # Create mask: True for real data, False for padding
+        lengths_expanded = lengths.unsqueeze(1).expand(batch_size, max_len)
+        mask = seq_range < lengths_expanded
+        
+        return mask.float()
+    
+    def forward(self, x, lengths=None):
+        batch_size = x.size(0)
+        seq_len = x.size(2)
+        
         # Split sensor data
         imu_data = x[:, :self.n_imu_total, :]
         thm_data = x[:, self.n_imu_total:self.n_imu_total+self.n_thm_features, :]
@@ -329,12 +440,42 @@ class ImprovedBFRBModel(nn.Module):
         # Apply fusion layers
         fused = self.fusion_layers(combined)
         
-        # Apply attention
-        attention_weights = self.attention(fused)
+        # Apply attention with masking
+        attention_logits = self.attention_conv(fused)  # Get attention logits
+        attention_logits = attention_logits.squeeze(1)  # Remove channel dimension
+        
+        if lengths is not None:
+            # Adjust lengths for downsampling through the network
+            # We have stride=2 in encoders, so effective sequence length is reduced
+            downsampled_lengths = (lengths + 1) // 2  # Account for stride=2
+            # AdaptiveAvgPool1d operations don't change the sequence length conceptually
+            # but we need to account for the actual output size from fusion layers
+            fused_seq_len = fused.size(2)
+            
+            # Create attention mask for the fused sequence length
+            attention_mask = self.create_attention_mask(fused_seq_len, downsampled_lengths)
+            
+            # Apply mask by setting padded positions to -inf before softmax
+            attention_logits = attention_logits.masked_fill(~attention_mask.bool(), float('-inf'))
+        
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_logits, dim=1).unsqueeze(1)
+        
+        # Apply attention weights
         weighted = fused * attention_weights
         
-        # Global pooling
-        global_features = weighted.sum(dim=2)
+        # Global pooling with masking
+        if lengths is not None:
+            # Sum only over non-padded positions
+            attention_mask = attention_mask.unsqueeze(1)  # Add channel dimension
+            weighted_masked = weighted * attention_mask
+            global_features = weighted_masked.sum(dim=2)
+            
+            # Normalize by actual sequence length to get true average
+            valid_lengths = attention_mask.sum(dim=2).clamp(min=1)  # Avoid division by zero
+            global_features = global_features / valid_lengths
+        else:
+            global_features = weighted.sum(dim=2)
         
         # Shared processing
         shared = self.shared_fc(global_features)
@@ -373,7 +514,7 @@ class BFRBPredictor:
         # Load all models for ensemble
         for model_path in existing_models:
             print(f"Loading model: {model_path}")
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             
             # Load feature columns and model configuration
             if self.feature_cols is None:
@@ -399,6 +540,10 @@ class BFRBPredictor:
         # Use first label encoder as reference
         self.label_encoder = self.label_encoders[0]
         
+        # Verify label encoder loaded correctly
+        print(f"Label encoder classes: {len(self.label_encoder.classes_)}")
+        print(f"First few classes: {list(self.label_encoder.classes_[:3])}")
+        
         # Create gesture name to ID mapping
         self.gesture_to_id = {name: idx for idx, name in enumerate(self.label_encoder.classes_)}
         
@@ -413,10 +558,13 @@ class BFRBPredictor:
         # Convert to pandas for processing
         df = df_polars.to_pandas()
         
-        # Get feature columns
+        # Get feature columns - MUST match training exactly!
         if self.feature_cols is None:
-            # Use default feature columns
-            base_feature_cols = [col for col in df.columns if col.startswith(('acc_', 'rot_', 'thm_', 'tof_'))]
+            # This should not happen if models are loaded correctly
+            # But provide fallback that matches the training script
+            base_feature_cols = [col for col in df.columns if col.startswith(('linear_acc_', 'rot_', 'thm_', 'tof_'))]
+            # Keep acc_ columns for compatibility but they shouldn't be primary features
+            base_feature_cols += [col for col in df.columns if col.startswith('acc_') and col not in base_feature_cols]
             
             engineered_cols = []
             if CONFIG['use_angular_velocity']:
@@ -424,7 +572,8 @@ class BFRBPredictor:
             if CONFIG['use_angular_distance']:
                 engineered_cols.append('angular_distance')
             if CONFIG['use_statistical_features']:
-                engineered_cols.extend(['jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
+                engineered_cols.extend(['linear_acc_mag', 'linear_acc_mag_jerk',
+                                      'jerk_x', 'jerk_y', 'jerk_z', 'acc_magnitude',
                                       'acc_mad_x', 'acc_mad_y', 'acc_mad_z', 'rotation_angle'])
             
             self.feature_cols = base_feature_cols + engineered_cols
@@ -432,7 +581,7 @@ class BFRBPredictor:
         # Extract features
         features = df[self.feature_cols].values
         
-        # Handle NaN values
+        # Handle NaN values (must match training preprocessing)
         features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         
         return features
