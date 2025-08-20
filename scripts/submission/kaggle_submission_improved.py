@@ -711,15 +711,8 @@ class BFRBPredictor:
                 best_bfrb_id = max(bfrb_probs, key=lambda x: x[1])[0]
                 final_gesture = self.label_encoder.classes_[best_bfrb_id]
         else:
-            # Find the most likely non-BFRB gesture
-            non_bfrb_ids = [i for i in range(len(self.label_encoder.classes_)) 
-                           if i not in self.bfrb_gesture_ids]
-            if non_bfrb_ids:
-                non_bfrb_probs = [(i, multi_probs[i]) for i in non_bfrb_ids]
-                best_non_bfrb_id = max(non_bfrb_probs, key=lambda x: x[1])[0]
-                final_gesture = self.label_encoder.classes_[best_non_bfrb_id]
-            else:
-                final_gesture = self.label_encoder.classes_[gesture_id]
+            # Non-BFRB: always return "Text on phone" (all non-BFRB map to "non_target" in scoring)
+            final_gesture = 'Text on phone'
         
         return final_gesture
     
@@ -746,15 +739,8 @@ class BFRBPredictor:
                 best_bfrb_id = max(bfrb_probs, key=lambda x: x[1])[0]
                 return self.label_encoder.classes_[best_bfrb_id]
             else:
-                # Find most likely non-BFRB
-                non_bfrb_ids = [i for i in range(len(self.label_encoder.classes_)) 
-                               if i not in self.bfrb_gesture_ids]
-                if non_bfrb_ids:
-                    non_bfrb_probs = [(i, pred['multi_probs'][i]) for i in non_bfrb_ids]
-                    best_non_bfrb_id = max(non_bfrb_probs, key=lambda x: x[1])[0]
-                    return self.label_encoder.classes_[best_non_bfrb_id]
-                else:
-                    return self.label_encoder.classes_[gesture_id]
+                # Non-BFRB: always return "Text on phone"
+                return 'Text on phone'
 
 
 # ===== INITIALIZE PREDICTOR =====

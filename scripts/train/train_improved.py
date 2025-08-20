@@ -282,10 +282,7 @@ class FeatureEngineer:
         return pd.concat(engineered_features, ignore_index=True)
 
 
-# Note: Quaternion helper functions are no longer needed as we use scipy.spatial.transform.Rotation
-
-
-# ===== MODEL ARCHITECTURE (same as before) =====
+# ===== MODEL ARCHITECTURE =====
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation block for channel attention"""
     def __init__(self, channels, reduction=16):
@@ -596,7 +593,7 @@ def collate_fn(batch):
     return padded_sequences, binary_labels, multiclass_labels, lengths
 
 
-# ===== LOSS FUNCTIONS (same as before) =====
+# ===== LOSS FUNCTIONS =====
 class FocalLoss(nn.Module):
     """Focal loss for handling class imbalance"""
     def __init__(self, gamma=2.0, alpha=None):
@@ -759,14 +756,21 @@ def train_epoch(model, train_loader, criterion_binary, criterion_multi, optimize
     return total_loss / len(train_loader)
 
 
-def validate(model, val_loader, device, criterion_binary=None, criterion_multi=None, realistic_test=True):
-    """Validate the model with realistic test conditions (50% IMU-only)"""
+def validate_with_gating(model, val_loader, device, label_encoder, criterion_binary=None, criterion_multi=None, realistic_test=True):
+    """
+    Validate using the EXACT same gating logic as submission.
+    This ensures CV metrics match what Kaggle will compute.
+    """
     model.eval()
-    binary_preds = []
-    binary_true = []
-    multi_preds = []
-    multi_true = []
+    final_gesture_preds = []  # The single gesture we predict
+    true_gestures = []  # The true gesture labels
     total_loss = 0
+    
+    # Get BFRB gesture IDs for gating logic
+    bfrb_gesture_ids = set()
+    for gesture in BFRB_GESTURES:
+        if gesture in label_encoder.classes_:
+            bfrb_gesture_ids.add(label_encoder.transform([gesture])[0])
     
     with torch.no_grad():
         for sequences, labels_b, labels_m, lengths in tqdm(val_loader, desc='Validating', leave=False):
@@ -792,17 +796,48 @@ def validate(model, val_loader, device, criterion_binary=None, criterion_multi=N
                 loss = 0.6 * loss_binary + 0.4 * loss_multi
                 total_loss += loss.item()
             
-            binary_pred = torch.argmax(outputs['binary'], dim=1).cpu().numpy()
-            multi_pred = torch.argmax(outputs['multiclass'], dim=1).cpu().numpy()
+            # Get probabilities (matching submission logic)
+            binary_probs = F.softmax(outputs['binary'], dim=1).cpu().numpy()
+            multi_probs = F.softmax(outputs['multiclass'], dim=1).cpu().numpy()
             
-            binary_preds.extend(binary_pred)
-            binary_true.extend(labels_b.numpy())
-            multi_preds.extend(multi_pred)
-            multi_true.extend(labels_m.numpy())
+            # Apply gating logic for each sample (EXACTLY like submission)
+            for i in range(len(labels_m)):
+                is_bfrb = binary_probs[i, 1] > 0.5
+                
+                if is_bfrb:
+                    # Pick best gesture from BFRB set only
+                    bfrb_probs = [(idx, multi_probs[i, idx]) for idx in bfrb_gesture_ids]
+                    if bfrb_probs:
+                        best_gesture_id = max(bfrb_probs, key=lambda x: x[1])[0]
+                    else:
+                        # Fallback if no BFRB gestures defined
+                        best_gesture_id = np.argmax(multi_probs[i])
+                else:
+                    # Non-BFRB: all map to "non_target" in scoring, so just use first non-BFRB
+                    non_bfrb_ids = [idx for idx in range(len(label_encoder.classes_)) 
+                                   if idx not in bfrb_gesture_ids]
+                    best_gesture_id = non_bfrb_ids[0] if non_bfrb_ids else 0
+                
+                final_gesture_preds.append(best_gesture_id)
+                true_gestures.append(labels_m[i].item())
     
-    # Calculate F1 scores
-    binary_f1 = f1_score(binary_true, binary_preds, average='binary')
-    multi_f1 = f1_score(multi_true, multi_preds, average='macro')
+    # Now derive binary labels from the gesture predictions (like Kaggle does)
+    binary_preds_derived = [1 if g in bfrb_gesture_ids else 0 for g in final_gesture_preds]
+    binary_true_derived = [1 if g in bfrb_gesture_ids else 0 for g in true_gestures]
+    
+    # Calculate F1 scores using the derived labels
+    binary_f1 = f1_score(binary_true_derived, binary_preds_derived, average='binary')
+    
+    # For multiclass F1, map non-BFRB gestures to a single "non_target" class (like Kaggle does)
+    # This matches the official scoring function
+    mapped_true = []
+    mapped_preds = []
+    for true_g, pred_g in zip(true_gestures, final_gesture_preds):
+        # Map gesture IDs to either their BFRB class or "non_target"
+        mapped_true.append(true_g if true_g in bfrb_gesture_ids else -1)  # -1 represents non_target
+        mapped_preds.append(pred_g if pred_g in bfrb_gesture_ids else -1)
+    
+    multi_f1 = f1_score(mapped_true, mapped_preds, average='macro')
     competition_score = (binary_f1 + multi_f1) / 2
     
     result = {
@@ -819,21 +854,28 @@ def validate(model, val_loader, device, criterion_binary=None, criterion_multi=N
     return result
 
 
-def validate_dual(model, val_loader, device, criterion_binary=None, criterion_multi=None):
+
+def validate_dual(model, val_loader, device, label_encoder, criterion_binary=None, criterion_multi=None):
     """
     Dual evaluation strategy: evaluate on both full-sensor and IMU-only data
     This gives a more realistic estimate of test performance
+    NOW USES GATING LOGIC TO MATCH SUBMISSION!
     """
     model.eval()
     
-    # First pass: Full sensor evaluation
-    full_sensor_results = validate(model, val_loader, device, criterion_binary, criterion_multi, realistic_test=False)
+    # First pass: Full sensor evaluation with gating logic
+    full_sensor_results = validate_with_gating(model, val_loader, device, label_encoder, 
+                                              criterion_binary, criterion_multi, realistic_test=False)
     
-    # Second pass: IMU-only evaluation (force all sequences to be IMU-only)
-    imu_only_binary_preds = []
-    imu_only_binary_true = []
-    imu_only_multi_preds = []
-    imu_only_multi_true = []
+    # Second pass: IMU-only evaluation with gating logic
+    # Get BFRB gesture IDs for gating logic
+    bfrb_gesture_ids = set()
+    for gesture in BFRB_GESTURES:
+        if gesture in label_encoder.classes_:
+            bfrb_gesture_ids.add(label_encoder.transform([gesture])[0])
+    
+    final_gesture_preds_imu = []
+    true_gestures_imu = []
     imu_only_loss = 0
     
     with torch.no_grad():
@@ -856,22 +898,51 @@ def validate_dual(model, val_loader, device, criterion_binary=None, criterion_mu
                 loss = 0.6 * loss_binary + 0.4 * loss_multi
                 imu_only_loss += loss.item()
             
-            binary_pred = torch.argmax(outputs['binary'], dim=1).cpu().numpy()
-            multi_pred = torch.argmax(outputs['multiclass'], dim=1).cpu().numpy()
+            # Get probabilities and apply gating logic (EXACTLY like submission)
+            binary_probs = F.softmax(outputs['binary'], dim=1).cpu().numpy()
+            multi_probs = F.softmax(outputs['multiclass'], dim=1).cpu().numpy()
             
-            imu_only_binary_preds.extend(binary_pred)
-            imu_only_binary_true.extend(labels_b.numpy())
-            imu_only_multi_preds.extend(multi_pred)
-            imu_only_multi_true.extend(labels_m.numpy())
+            # Apply gating logic for each sample
+            for i in range(len(labels_m)):
+                is_bfrb = binary_probs[i, 1] > 0.5
+                
+                if is_bfrb:
+                    # Pick best gesture from BFRB set only
+                    bfrb_probs = [(idx, multi_probs[i, idx]) for idx in bfrb_gesture_ids]
+                    if bfrb_probs:
+                        best_gesture_id = max(bfrb_probs, key=lambda x: x[1])[0]
+                    else:
+                        best_gesture_id = np.argmax(multi_probs[i])
+                else:
+                    # Non-BFRB: always return first non-BFRB (they all map to "non_target")
+                    non_bfrb_ids = [idx for idx in range(len(label_encoder.classes_)) 
+                                   if idx not in bfrb_gesture_ids]
+                    best_gesture_id = non_bfrb_ids[0] if non_bfrb_ids else 0
+                
+                final_gesture_preds_imu.append(best_gesture_id)
+                true_gestures_imu.append(labels_m[i].item())
     
-    # Calculate IMU-only F1 scores
-    imu_binary_f1 = f1_score(imu_only_binary_true, imu_only_binary_preds, average='binary')
-    imu_multi_f1 = f1_score(imu_only_multi_true, imu_only_multi_preds, average='macro')
+    # Derive binary labels from gesture predictions (like Kaggle does)
+    imu_binary_preds_derived = [1 if g in bfrb_gesture_ids else 0 for g in final_gesture_preds_imu]
+    imu_binary_true_derived = [1 if g in bfrb_gesture_ids else 0 for g in true_gestures_imu]
+    
+    # Calculate IMU-only F1 scores using derived labels
+    imu_binary_f1 = f1_score(imu_binary_true_derived, imu_binary_preds_derived, average='binary')
+    
+    # For multiclass F1, map non-BFRB gestures to a single "non_target" class (like Kaggle does)
+    mapped_true_imu = []
+    mapped_preds_imu = []
+    for true_g, pred_g in zip(true_gestures_imu, final_gesture_preds_imu):
+        mapped_true_imu.append(true_g if true_g in bfrb_gesture_ids else -1)  # -1 represents non_target
+        mapped_preds_imu.append(pred_g if pred_g in bfrb_gesture_ids else -1)
+    
+    imu_multi_f1 = f1_score(mapped_true_imu, mapped_preds_imu, average='macro')
     imu_competition_score = (imu_binary_f1 + imu_multi_f1) / 2
     
-    # Third pass: Mixed evaluation (original 50/50 approach)
+    # Third pass: Mixed evaluation (50/50 approach) with gating logic
     print("  Evaluating with mixed sensors (50% IMU-only)...")
-    mixed_results = validate(model, val_loader, device, criterion_binary, criterion_multi, realistic_test=True)
+    mixed_results = validate_with_gating(model, val_loader, device, label_encoder, 
+                                        criterion_binary, criterion_multi, realistic_test=True)
     
     # Compute realistic composite scores (average of full and IMU-only)
     realistic_binary_f1 = (full_sensor_results['binary_f1'] + imu_binary_f1) / 2
@@ -986,7 +1057,7 @@ def main():
     
     # Create variable length sequences
     print("\n Creating variable length sequences...")
-    X, y_binary, y_multi, seq_lengths, seq_ids, subject_ids = create_variable_sequences(
+    X, y_binary, y_multi, seq_lengths, _, subject_ids = create_variable_sequences(
         df, feature_cols
     )
     
@@ -1021,9 +1092,7 @@ def main():
         
         cv_scores = []
         
-        # Calculate class weights for loss function
-        labels_for_weights = y_multi
-        class_weights = compute_class_weight('balanced', classes=np.unique(labels_for_weights), y=labels_for_weights)
+        # Calculate class weights for loss function (removed - not used)
         
         for fold, (train_idx, val_idx) in enumerate(splits):
             print(f"\n[FOLD {fold + 1}/{CONFIG['n_folds']}]")
@@ -1162,7 +1231,7 @@ def main():
                 train_losses.append(train_loss)
                 
                 # Validate using dual evaluation
-                val_metrics = validate_dual(model, val_loader, CONFIG['device'], criterion_binary, criterion_multi)
+                val_metrics = validate_dual(model, val_loader, CONFIG['device'], label_encoder, criterion_binary, criterion_multi)
                 
                 # Track the realistic composite score (average of full and IMU-only)
                 val_scores.append(val_metrics['realistic_competition_score'])
