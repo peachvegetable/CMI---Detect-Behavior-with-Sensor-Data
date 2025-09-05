@@ -47,12 +47,11 @@ class FeatureEngineer:
             acc_values = acc_data
         
         if isinstance(rot_data, pd.DataFrame):
-            # Note: rot_data columns are [rot_w, rot_x, rot_y, rot_z]
             # scipy expects [x, y, z, w] format
             quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
         else:
-            # Reorder from [w, x, y, z] to [x, y, z, w]
-            quat_values = rot_data[:, [1, 2, 3, 0]]
+            # Already in [x, y, z, w] format from extraction
+            quat_values = rot_data
         
         num_samples = acc_values.shape[0]
         linear_accel = np.zeros_like(acc_values)
@@ -78,8 +77,8 @@ class FeatureEngineer:
         if isinstance(rotation_data, pd.DataFrame):
             quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
         else:
-            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
-            quat_values = rotation_data[:, [1, 2, 3, 0]]
+            # Already in [x, y, z, w] format from extraction
+            quat_values = rotation_data
         
         num_samples = quat_values.shape[0]
         angular_vel = np.zeros((num_samples, 3))
@@ -112,8 +111,8 @@ class FeatureEngineer:
         if isinstance(rotation_data, pd.DataFrame):
             quat_values = rotation_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
         else:
-            # Reorder from [w, x, y, z] to [x, y, z, w] for scipy
-            quat_values = rotation_data[:, [1, 2, 3, 0]]
+            # Already in [x, y, z, w] format from extraction
+            quat_values = rotation_data
         
         num_samples = quat_values.shape[0]
         angular_dist = np.zeros(num_samples)
@@ -174,24 +173,25 @@ class FeatureEngineer:
         # Convert to pandas for easier manipulation
         df_pd = df.to_pandas()
         
-        # CRITICAL: Process each sequence separately to match training
+        # For inference, we typically get a single sequence
+        # Add sequence_id if not present (for test data)
+        if 'sequence_id' not in df_pd.columns:
+            df_pd['sequence_id'] = 0
+        
+        # Process the sequence (usually just one for inference)
         engineered_features = []
         
-        # Get unique sequence IDs (should be just one for inference)
-        sequence_ids = df_pd['sequence_id'].unique() if 'sequence_id' in df_pd.columns else [0]
+        # Get unique sequence IDs
+        sequence_ids = df_pd['sequence_id'].unique()
         
         for seq_id in sequence_ids:
             # Extract sequence data
-            if 'sequence_id' in df_pd.columns:
-                seq_data = df_pd[df_pd['sequence_id'] == seq_id].copy()
-            else:
-                # If no sequence_id column, treat entire dataframe as one sequence
-                seq_data = df_pd.copy()
-                seq_data['sequence_id'] = 0
+            seq_data = df_pd[df_pd['sequence_id'] == seq_id].copy()
             
             # Extract base features
             acc_data = seq_data[['acc_x', 'acc_y', 'acc_z']].values
-            rot_data = seq_data[['rot_w', 'rot_x', 'rot_y', 'rot_z']].values
+            # CRITICAL: scipy expects [x, y, z, w] order for quaternions
+            rot_data = seq_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
             
             # Remove gravity from acceleration first (CRITICAL!)
             linear_accel = FeatureEngineer.remove_gravity_from_acc(acc_data, rot_data)
@@ -682,39 +682,21 @@ class BFRBPredictor:
     
     def predict_ensemble(self, features):
         """Make ensemble prediction using all models"""
-        all_binary_probs = []
         all_multi_probs = []
         
         # Get predictions from all models
         for i in range(len(self.models)):
             pred = self.predict_single(features, model_idx=i)
-            all_binary_probs.append(pred['binary_probs'])
             all_multi_probs.append(pred['multi_probs'])
         
         # Average probabilities
-        binary_probs = np.mean(all_binary_probs, axis=0)
         multi_probs = np.mean(all_multi_probs, axis=0)
         
-        # Get predictions
-        is_bfrb = binary_probs[1] > 0.5
-        gesture_id = np.argmax(multi_probs)
+        # SIMPLIFIED: Just return the class with highest probability
+        # This matches what the high-scoring notebook does
+        best_gesture_id = np.argmax(multi_probs)
         
-        # If predicted as BFRB, use the multiclass prediction
-        # Otherwise, return the most likely non-BFRB gesture
-        if is_bfrb:
-            # Check if the predicted gesture is actually a BFRB
-            if gesture_id in self.bfrb_gesture_ids:
-                final_gesture = self.label_encoder.classes_[gesture_id]
-            else:
-                # Find the most likely BFRB gesture
-                bfrb_probs = [(i, multi_probs[i]) for i in self.bfrb_gesture_ids]
-                best_bfrb_id = max(bfrb_probs, key=lambda x: x[1])[0]
-                final_gesture = self.label_encoder.classes_[best_bfrb_id]
-        else:
-            # Non-BFRB: always return "Text on phone" (all non-BFRB map to "non_target" in scoring)
-            final_gesture = 'Text on phone'
-        
-        return final_gesture
+        return self.label_encoder.classes_[best_gesture_id]
     
     def predict(self, sequence_df):
         """Main prediction function"""
@@ -727,20 +709,10 @@ class BFRBPredictor:
         else:
             pred = self.predict_single(features, model_idx=0)
             
-            # Process single model prediction
-            is_bfrb = pred['binary_probs'][1] > 0.5
-            gesture_id = np.argmax(pred['multi_probs'])
-            
-            if is_bfrb and gesture_id in self.bfrb_gesture_ids:
-                return self.label_encoder.classes_[gesture_id]
-            elif is_bfrb:
-                # Find most likely BFRB
-                bfrb_probs = [(i, pred['multi_probs'][i]) for i in self.bfrb_gesture_ids]
-                best_bfrb_id = max(bfrb_probs, key=lambda x: x[1])[0]
-                return self.label_encoder.classes_[best_bfrb_id]
-            else:
-                # Non-BFRB: always return "Text on phone"
-                return 'Text on phone'
+            # SIMPLIFIED: Just use multiclass output directly
+            # Ignore binary head - trust the model's multiclass predictions
+            best_gesture_id = np.argmax(pred['multi_probs'])
+            return self.label_encoder.classes_[best_gesture_id]
 
 
 # ===== INITIALIZE PREDICTOR =====
